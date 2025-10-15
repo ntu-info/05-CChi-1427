@@ -8,6 +8,10 @@ from sqlalchemy.exc import OperationalError
 _engine = None
 
 def get_engine():
+    """
+    Initializes and returns a global SQLAlchemy engine instance.
+    Reads database URL from environment variables.
+    """
     global _engine
     if _engine is not None:
         return _engine
@@ -24,6 +28,9 @@ def get_engine():
     return _engine
 
 def create_app():
+    """
+    Flask application factory.
+    """
     app = Flask(__name__)
 
     @app.get("/", endpoint="health")
@@ -34,18 +41,89 @@ def create_app():
     def show_img():
         return send_file("amygdala.gif", mimetype="image/gif")
 
-    @app.get("/terms/<term>/studies", endpoint="terms_studies")
-    def get_studies_by_term(term):
-        return term
+    # --- 新增的 API 端點 ---
 
-    @app.get("/locations/<coords>/studies", endpoint="locations_studies")
-    def get_studies_by_coordinates(coords):
-        x, y, z = map(int, coords.split("_"))
-        return jsonify([x, y, z])
+    @app.get("/dissociate/terms/<term_a>/<term_b>", endpoint="dissociate_terms")
+    def dissociate_by_terms(term_a, term_b):
+        """
+        Returns studies that mention term_a but not term_b.
+        """
+        sql = text("""
+            -- Select studies associated with the first term
+            SELECT DISTINCT study_id FROM ns.annotations_terms WHERE term = :term_a
+            -- Subtract studies also associated with the second term
+            EXCEPT
+            SELECT DISTINCT study_id FROM ns.annotations_terms WHERE term = :term_b;
+        """)
+        try:
+            with get_engine().connect() as conn:
+                result = conn.execute(sql, {"term_a": term_a, "term_b": term_b}).fetchall()
+                # The result is a list of tuples, e.g., [('pmid1',), ('pmid2',)]
+                # We extract the first element of each tuple to create a simple list.
+                studies = [row[0] for row in result]
+                return jsonify({
+                    "term_a_not_b": {
+                        "term_a": term_a,
+                        "term_b": term_b,
+                        "count": len(studies),
+                        "studies": studies
+                    }
+                })
+        except Exception as e:
+            abort(500, description=f"Database query failed: {e}")
+
+    @app.get("/dissociate/locations/<coords_a>/<coords_b>", endpoint="dissociate_locations")
+    def dissociate_by_locations(coords_a, coords_b):
+        """
+        Returns studies with activations near coords_a but not near coords_b.
+        A search radius of 10mm is used for matching coordinates.
+        """
+        try:
+            x_a, y_a, z_a = map(int, coords_a.split("_"))
+            x_b, y_b, z_b = map(int, coords_b.split("_"))
+        except ValueError:
+            abort(400, description="Invalid coordinate format. Expected x_y_z.")
+
+        # Using PostGIS for spatial queries. ST_DWithin checks if geometries are within a specified distance.
+        # We create points from the input coordinates and search for study coordinates within a 10mm radius.
+        sql = text("""
+            -- Select studies with a coordinate near location A
+            SELECT DISTINCT study_id FROM ns.coordinates
+            WHERE ST_DWithin(geom, ST_MakePoint(:x_a, :y_a, :z_a), :radius)
+            -- Subtract studies that also have a coordinate near location B
+            EXCEPT
+            SELECT DISTINCT study_id FROM ns.coordinates
+            WHERE ST_DWithin(geom, ST_MakePoint(:x_b, :y_b, :z_b), :radius);
+        """)
+
+        params = {
+            "x_a": x_a, "y_a": y_a, "z_a": z_a,
+            "x_b": x_b, "y_b": y_b, "z_b": z_b,
+            "radius": 10  # Search radius in mm
+        }
+
+        try:
+            with get_engine().connect() as conn:
+                result = conn.execute(sql, params).fetchall()
+                studies = [row[0] for row in result]
+                return jsonify({
+                    "location_a_not_b": {
+                        "location_a": f"{x_a}_{y_a}_{z_a}",
+                        "location_b": f"{x_b}_{y_b}_{z_b}",
+                        "radius_mm": params["radius"],
+                        "count": len(studies),
+                        "studies": studies
+                    }
+                })
+        except Exception as e:
+            abort(500, description=f"Database query failed: {e}")
+
 
     @app.get("/test_db", endpoint="test_db")
-    
     def test_db():
+        """
+        Tests database connectivity and provides schema information.
+        """
         eng = get_engine()
         payload = {"ok": False, "dialect": eng.dialect.name}
 
@@ -60,30 +138,6 @@ def create_app():
                 payload["metadata_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.metadata")).scalar()
                 payload["annotations_terms_count"] = conn.execute(text("SELECT COUNT(*) FROM ns.annotations_terms")).scalar()
 
-                # Samples
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, ST_X(geom) AS x, ST_Y(geom) AS y, ST_Z(geom) AS z FROM ns.coordinates LIMIT 3"
-                    )).mappings().all()
-                    payload["coordinates_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["coordinates_sample"] = []
-
-                try:
-                    # Select a few columns if they exist; otherwise select a generic subset
-                    rows = conn.execute(text("SELECT * FROM ns.metadata LIMIT 3")).mappings().all()
-                    payload["metadata_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["metadata_sample"] = []
-
-                try:
-                    rows = conn.execute(text(
-                        "SELECT study_id, contrast_id, term, weight FROM ns.annotations_terms LIMIT 3"
-                    )).mappings().all()
-                    payload["annotations_terms_sample"] = [dict(r) for r in rows]
-                except Exception:
-                    payload["annotations_terms_sample"] = []
-
             payload["ok"] = True
             return jsonify(payload), 200
 
@@ -93,5 +147,5 @@ def create_app():
 
     return app
 
-# WSGI entry point (no __main__)
+# WSGI entry point
 app = create_app()
